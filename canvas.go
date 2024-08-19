@@ -3,7 +3,6 @@ package main
 import (
     "fmt"
     "strings"
-    "time"
 )
 
 const (
@@ -84,6 +83,14 @@ func (c *Canvas) DrawRect(topLeft, bottomRight Point) {
     c.DrawCell(rowEnd, colEnd, bottomRightChar)
 }
 
+func (c *Canvas) Reset() {
+    for row := range c.Rows {
+        for col := range c.Cols {
+            c.canvas[row][col] = " "
+        }
+    }
+}
+
 func (c *Canvas) Display() {
     rows := make([]string, 0)
     for _, row := range c.canvas {
@@ -91,8 +98,6 @@ func (c *Canvas) Display() {
     }
     fmt.Print(strings.Join(rows, "\n"))
     fmt.Println()
-
-    time.Sleep(300 * time.Millisecond)
 
     fmt.Printf("\033[%dA", c.Rows)
     fmt.Printf("\033[%dD", c.Cols)

@@ -3,31 +3,36 @@ package main
 import (
 	"bufio"
 	"encoding/binary"
-	"fmt"
 	"io"
 	"log"
 	"math"
+	"math/cmplx"
 	"os"
 	"os/exec"
 
 	"github.com/gordonklaus/portaudio"
+	"golang.org/x/term"
+)
+
+const (
+    logFileName = "log.txt"
 )
 
 type MusicVisualizer struct {
     TopLeft Point
     Rows int
     Cols int
-    Bars []int
+    Bars []float64
     barWidth int
     barSpacing int
     barPadding int
     canvas *Canvas
 }
 
-func NewMusicVisualizer(canvas *Canvas, topLeft Point, rows, cols int, bars []int) *MusicVisualizer {
+func NewMusicVisualizer(canvas *Canvas, topLeft Point, rows, cols int, bars []float64) *MusicVisualizer {
     barPadding := 3
     barSpacing := 2
-    barWidth := 10
+    barWidth := 1
     return &MusicVisualizer{
         barWidth: barWidth,
         barSpacing: barSpacing,
@@ -48,7 +53,8 @@ func (m *MusicVisualizer) onHorizontalBar(row, col int) bool {
 
     if col % (m.barSpacing + m.barWidth) < m.barWidth {
         index := col / (m.barSpacing + m.barWidth)
-        if index >= len(m.Bars) || row < m.Rows - 2 - m.Bars[index] {
+        height := int(math.Ceil(float64(m.Rows - 3) * m.Bars[index]))
+        if index >= len(m.Bars) || row < height {
             return false
         }
         return true
@@ -61,7 +67,8 @@ func (m *MusicVisualizer) Draw() error {
     m.canvas.DrawRect(m.TopLeft, Point{m.TopLeft.X + m.Rows - 1, m.TopLeft.Y + m.Cols - 1})
 
     for i, bar := range m.Bars {
-        row := m.TopLeft.Y + m.Rows - bar
+        height := int(math.Ceil(float64(m.Rows - 3) * bar))
+        row := m.TopLeft.Y + m.Rows - height
         col := m.TopLeft.X + m.barPadding + i * (m.barWidth + m.barSpacing)
         m.canvas.DrawFilledRect(Point{row, col}, Point{m.Rows - 2, col + m.barWidth})
     }
@@ -95,25 +102,70 @@ func createFfmpegPipe(filename string) (output io.ReadCloser) {
     return
 }
 
-func save(frames []float64) {
-    path := "./out.txt"
-    fmt.Println("saving")
-    file, err := os.Create(path)
-    check(err)
-    defer file.Close()
+func fft(signal []complex128) []complex128 {
+    n := len(signal)
+    if n == 1 {
+        return signal
+    }
 
-    w := bufio.NewWriter(file)
-    fmt.Fprintln(w, frames)
-    err = w.Flush()
-    fmt.Println("saved")
-    check(err)
+    odd := make([]complex128, n / 2)
+    even := make([]complex128, n / 2)
+    for i := range n / 2 {
+        odd[i] = signal[2 * i]
+        even[i] = signal[2 * i + 1]
+    }
+
+    oddFft := fft(odd)
+    evenFft := fft(even)
+    out := make([]complex128, n)
+
+    for i := range n / 2 {
+        component := -2.0 * math.Pi * float64(i) / float64(n)
+        oddFactor := complex(math.Cos(component), math.Sin(component)) * oddFft[i]
+
+        out[i] = evenFft[i] + oddFactor
+        out[i + n / 2] = evenFft[i] - oddFactor
+    }
+
+    return out
 }
 
-func playAudioFile(filename string) {
-    output := createFfmpegPipe(filename)
-    samples := make([]float64, 0)
+func toComplexArray(arr []float64) []complex128 {
+    out := make([]complex128, len(arr))
+    for i, v := range arr {
+        out[i] = complex(v, 0)
+    }
+    return out
+}
 
-    bufSize := 2048
+func main() {
+    logFile, err := os.Create(logFileName)
+    defer func() {
+        check(logFile.Close())
+    }()
+
+    w := bufio.NewWriter(logFile)
+    log.SetOutput(w)
+    check(err)
+
+
+    width, height, err := term.GetSize(0)
+    check(err)
+    rows := height - 1
+    cols := width
+
+    numBars := 60
+    bars := make([]float64, numBars)
+    canvas := NewCanvas(rows, cols)
+    musicVisualizer := NewMusicVisualizer(canvas, Point{0, 0}, rows, cols, bars)
+
+    filename := getAudioFileArg()    
+
+    output := createFfmpegPipe(filename)
+
+    bufSize := 1 << 11
+    samples := make([]float64, bufSize)
+
     audiobuf := make([]int32, bufSize)
     portaudio.Initialize()
     defer portaudio.Terminate()
@@ -130,34 +182,60 @@ func playAudioFile(filename string) {
     defer stream.Stop()
 
     for err = binary.Read(output, binary.LittleEndian, &audiobuf); err == nil; err = binary.Read(output, binary.LittleEndian, &audiobuf) {
+        bars = make([]float64, numBars)
+        canvas = NewCanvas(rows, cols)
+        musicVisualizer = NewMusicVisualizer(canvas, Point{0, 0}, rows, cols, bars)
+
         check(stream.Write())
-        for _, sample := range audiobuf {
-            samples = append(samples, float64(sample) / float64(math.Pow(2, 32)))
+        for i, sample := range audiobuf {
+            samples[i] = float64(sample) / float64(math.Pow(2, 32))
         }
-        // fft
+        frequencies := fft(toComplexArray(samples))
+        amplitudes := make([]float64, len(frequencies))
+        for i, freq := range frequencies {
+            amplitudes[i] = math.Log(cmplx.Abs(freq))
+        }
+
+        step := 1.08
+        lowf := 1.0
+        m := 0
+        maxAmp := 1.0
+        outLog := make([]float64, 0)
+        for f := lowf; f < float64(bufSize) / 2; f = math.Ceil(f * step) {
+            f1 := math.Ceil(f*step)
+            a := 0.0
+            for q := int(f); q < bufSize / 2 && q < int(f1); q++ {
+                b := amplitudes[q]
+                if b > a {
+                    a = b
+                }
+            }
+            if maxAmp < a {
+                maxAmp = a
+            }
+            outLog = append(outLog, a)
+            m++
+        }
+
+        for i, v := range outLog {
+            outLog[i] = v / maxAmp
+        }
+
+        for i := range bars {
+            bars[i] = 0
+        }
+
+        for i := range bars {
+            bars[i] = outLog[i]
+        }
+
+        canvas.Reset()
+        musicVisualizer.Draw()
+        canvas.Display()
+
+        check(err)
+        w.Flush()
     }
 
     check(err) 
-}
-
-
-func main() {
-    cols := 200
-    rows := 46
-    numBars := 15
-
-    bars := make([]int, numBars)
-    canvas := NewCanvas(rows, cols)
-    musicVisualizer := NewMusicVisualizer(canvas, Point{0, 0}, rows, cols, bars)
-
-    for {
-        for i := range bars {
-            bars[i] = bars[i] + 1
-        }
-
-        musicVisualizer.Draw()
-        canvas.Display()
-    }
-//    filename := getAudioFileArg()    
-//    playAudioFile(filename)
 }
